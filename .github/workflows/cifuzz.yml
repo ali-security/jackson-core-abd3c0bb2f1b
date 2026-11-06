@@ -1,8 +1,6 @@
 name: CIFuzz
 on:
-  pull_request:
-    branches: # Only works for 2.x, due package renaming in 3.0 (master)
-    - "2.18"
+  workflow_dispatch: {}
 permissions:
   contents: read
 concurrency:

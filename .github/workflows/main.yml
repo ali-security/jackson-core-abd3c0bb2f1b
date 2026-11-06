@@ -1,20 +1,18 @@
 name: Build and Deploy Snapshot
 on:
-  push:
-    branches: ['2.*']
-    paths-ignore:
-    - "README.md"
-    - "release-notes/*"
-  pull_request:
-    paths-ignore:
-    - "README.md"
-    - "release-notes/*"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional space-separated test class selectors; empty runs the full suite'
+        required: false
+        default: ''
 permissions:
   contents: read
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +42,36 @@ jobs:
         # gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }} # Value of the GPG private key to import
         # gpg-passphrase: MAVEN_GPG_PASSPHRASE # env variable for GPG private key passphrase
     - name: Build
-      run: ./mvnw -B -q -ff -ntp verify
+      shell: bash
+      env:
+        FILTER: ${{ inputs.test-filter }}
+      run: |
+        MVNW=./mvnw
+        if [ "$RUNNER_OS" = "Windows" ]; then MVNW=./mvnw.cmd; fi
+        if [ -n "$FILTER" ]; then
+          $MVNW -B -q -ff -ntp verify -DreuseForks=false -Dtest="${FILTER// /,}" -Dsurefire.failIfNoSpecifiedTests=false
+        else
+          $MVNW -B -q -ff -ntp verify -DreuseForks=false
+        fi
+    - name: Print test results
+      if: always()
+      shell: bash
+      run: |
+        PY=$(command -v python3 || command -v python)
+        "$PY" - <<'PYEOF'
+        import glob, xml.etree.ElementTree as ET
+        tot = fail = err = skip = 0
+        for f in sorted(glob.glob('target/surefire-reports/TEST-*.xml')):
+            r = ET.parse(f).getroot()
+            tot += int(r.get('tests', 0)); fail += int(r.get('failures', 0))
+            err += int(r.get('errors', 0)); skip += int(r.get('skipped', 0))
+            for tc in r.iter('testcase'):
+                for k in ('skipped', 'failure', 'error'):
+                    e = tc.find(k)
+                    if e is not None:
+                        print('%s: %s.%s -- %s' % (k.upper(), tc.get('classname'), tc.get('name'), (e.get('message') or '').strip()[:300]))
+        print('TEST SUMMARY: Tests run: %d, Passed: %d, Failures: %d, Errors: %d, Skipped: %d' % (tot, tot - fail - err - skip, fail, err, skip))
+        PYEOF
     - name: Extract project Maven version
       id: projectVersion
       # for some reason fails on Windows; we don't need it so skip:
@@ -54,7 +81,7 @@ jobs:
       if: ${{ matrix.release_build }}
       run: ./mvnw -B -q -ff -ntp -DskipTests animal-sniffer:check
     - name: Deploy snapshot
-      if: ${{ github.event_name != 'pull_request' && matrix.release_build && endsWith(steps.projectVersion.outputs.version, '-SNAPSHOT') }}
+      if: ${{ false && github.event_name != 'pull_request' && matrix.release_build && endsWith(steps.projectVersion.outputs.version, '-SNAPSHOT') }}
       env:
         CI_DEPLOY_USERNAME: ${{ secrets.CENTRAL_DEPLOY_USERNAME }}
         CI_DEPLOY_PASSWORD: ${{ secrets.CENTRAL_DEPLOY_PASSWORD }}
@@ -62,30 +89,19 @@ jobs:
       run: ./mvnw -B -q -ff -DskipTests -ntp source:jar deploy
     - name: Generate code coverage
       if: ${{ github.event_name != 'pull_request' && matrix.release_build }}
-      run: ./mvnw -B -q -ff -ntp test
+      run: ./mvnw -B -q -ff -ntp test -DreuseForks=false
     - name: Publish code coverage
-      if: ${{ github.event_name != 'pull_request' && matrix.release_build }}
+      if: ${{ false && github.event_name != 'pull_request' && matrix.release_build }}
       uses: codecov/codecov-action@e28ff129e5465c2c0dcc6f003fc735cb6ae0c673 # v4.5.0
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         file: ./target/site/jacoco/jacoco.xml
         flags: unittests
+    - name: Upload jar
+      if: ${{ matrix.release_build }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: jackson-core-jar
+        path: target/jackson-core-*[0-9].jar
+        if-no-files-found: error
 
-  trigger-dep-builds-v2:
-    name: Trigger downstream builds for v2
-    needs: [build]
-    # Only for pushes to default branch
-    if: ${{ github.event_name == 'push' && github.ref_name == '2.x' }}
-    uses: ./.github/workflows/trigger_dep_builds_v2.yml
-    secrets:
-      token: ${{ secrets.REPO_DISPATCH }}
-
-  trigger-dep-builds-v3:
-    name: Trigger downstream builds for v3
-    needs: [build]
-    # Only for pushes to master (v3) branch
-    if: ${{ github.event_name == 'push' && github.ref_name == '3.x' }}
-    uses: ./.github/workflows/trigger_dep_builds_v3.yml
-    secrets:
-      token: ${{ secrets.REPO_DISPATCH }}
-      
